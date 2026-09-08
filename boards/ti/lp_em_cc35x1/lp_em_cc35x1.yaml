@@ -12,4 +12,5 @@ supported:
   - gpio
   - pinctrl
   - serial
+  - spi
 vendor: ti
