@@ -16,6 +16,7 @@ supported:
   - gpio
   - serial
   - userspace
+  - dma
 testing:
   default: true
 vendor: ti
