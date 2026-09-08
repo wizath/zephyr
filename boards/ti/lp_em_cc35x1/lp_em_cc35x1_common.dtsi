@@ -57,6 +57,7 @@
 	aliases {
 		led0 = &red_led;
 		led1 = &blue_led;
+		ambient-temp0 = &tmp1075_temperature;
 		sw0 = &user_switch_1;
 		sw1 = &user_switch_2;
 		dma0 = &dma;
@@ -169,6 +170,23 @@
 			label = "storage";
 			reg = <0x8000 0x23000>;
 		};
+	};
+};
+
+&i2c1 {
+	status = "okay";
+	pinctrl-0 = <&i2c1_default>;
+	pinctrl-names = "default";
+
+	tmp1075_temperature: tmp1075@48 {
+		compatible = "lm75";
+		friendly-name = "texas_temperature_tmp1075";
+		reg = <0x48>;
+	};
+
+	bma4xx_accelerometer: bma4xx@18 {
+		compatible = "bosch,bma4xx";
+		reg = <0x18>;
 	};
 };
 

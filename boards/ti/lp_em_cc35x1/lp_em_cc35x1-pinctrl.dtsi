@@ -58,4 +58,10 @@
 		};
 	};
 
+	i2c1_default: i2c1_default {
+		group1 {
+			pinmux = <P10_I2C1_DATA>, <P11_I2C1_CLK>;
+		};
+	};
+
 };
