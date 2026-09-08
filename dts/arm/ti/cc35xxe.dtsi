@@ -11,6 +11,7 @@
 #define INT_SP_UART_0_INT_REQ       16
 #define INT_SP_UART_1_INT_REQ       17
 #define INT_SECURED_GPIO_IRQ_EVT_IND_OUT 33
+#define INT_NON_SECURED_DMA_IRQ_EVT_IND_OUT          41
 #define INT_RTC_EVENT_IRQ           65
 
 /*
@@ -20,6 +21,7 @@
 #define EXP_UARTA0   (INT_SP_UART_0_INT_REQ - 16)
 #define EXP_UARTA1   (INT_SP_UART_1_INT_REQ - 16)
 #define EXP_GPIO     (INT_SECURED_GPIO_IRQ_EVT_IND_OUT - 16)
+#define EXP_DMA_NS (INT_NON_SECURED_DMA_IRQ_EVT_IND_OUT - 16)
 #define EXP_RTC      (INT_RTC_EVENT_IRQ - 16)
 
 / {
@@ -178,6 +180,15 @@
 			reg = <0x41108000 0x4000>;
 			interrupts = <EXP_RTC 0>;
 			status = "okay";
+		};
+
+		dma: dma@41a00000 {
+			compatible = "ti,cc35xx-dma";
+			reg = <0x41a00000 0x10000>;
+			interrupts = <EXP_DMA_NS 0>;
+			dma-channels = <14>;
+			#dma-cells = <2>;
+			status = "disabled";
 		};
 
 		pinctrl: pin-controller@41140000 {
