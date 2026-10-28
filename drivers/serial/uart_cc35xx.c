@@ -29,6 +29,9 @@
 
 LOG_MODULE_REGISTER(uart_cc35xx);
 
+#define UART_CC35XX_IRQ_ENABLED                                                                    \
+	UTIL_OR(IS_ENABLED(CONFIG_UART_INTERRUPT_DRIVEN), IS_ENABLED(CONFIG_UART_ASYNC_API))
+
 #ifdef CONFIG_UART_ASYNC_API
 /*
  * Helper macro: computes the absolute register address for a given UART
@@ -64,9 +67,9 @@ struct uart_cc35xx_dev_config {
 	unsigned long base;    /* UART peripheral base address */
 	uint32_t sys_clk_freq; /* Source clock frequency in Hz (from DT clocks node) */
 	const struct pinctrl_dev_config *pcfg; /* Pin-control configuration (TX/RX/CTS/RTS mux) */
-#ifdef CONFIG_UART_INTERRUPT_DRIVEN
+#if defined(CONFIG_UART_INTERRUPT_DRIVEN) || defined(CONFIG_UART_ASYNC_API)
 	uart_irq_config_func_t irq_config_func; /* Board-level IRQ connect + enable function */
-#endif                                          /* CONFIG_UART_INTERRUPT_DRIVEN */
+#endif
 };
 
 /*
@@ -1203,8 +1206,18 @@ static int uart_cc35xx_init(const struct device *dev)
 
 	/* Clock + default 8N1 configuration */
 	UARTClockCtrl(config->base, true);
+	UARTDisable(config->base);
 	UARTConfigSetExpClk(config->base, config->sys_clk_freq, data->baud_rate,
 			    UART_CONFIG_WLEN_8 | UART_CONFIG_PAR_NONE | UART_CONFIG_STOP_ONE);
+#ifdef CONFIG_UART_USE_RUNTIME_CONFIGURE
+	data->uart_config = (struct uart_config){
+		.baudrate = data->baud_rate,
+		.parity = UART_CFG_PARITY_NONE,
+		.stop_bits = UART_CFG_STOP_BITS_1,
+		.data_bits = UART_CFG_DATA_BITS_8,
+		.flow_ctrl = UART_CFG_FLOW_CTRL_NONE,
+	};
+#endif
 	/* Start with flow control and all interrupts disabled */
 	UARTDisableCts(config->base);
 	UARTDisableRts(config->base);
@@ -1249,10 +1262,10 @@ static int uart_cc35xx_init(const struct device *dev)
 	UARTEnableFifo(config->base);
 #endif /* CONFIG_UART_ASYNC_API */
 
-#ifdef CONFIG_UART_INTERRUPT_DRIVEN
+#if defined(CONFIG_UART_INTERRUPT_DRIVEN) || defined(CONFIG_UART_ASYNC_API)
 	/* Connect and enable the UART interrupt at the NVIC level */
 	config->irq_config_func(dev);
-#endif /* CONFIG_UART_INTERRUPT_DRIVEN */
+#endif
 	return 0;
 }
 
@@ -1323,22 +1336,19 @@ static DEVICE_API(uart, uart_cc35xx_driver_api) = {
 /* clang-format off */
 #define UART_CC35XX_DEVICE(index) \
 	PINCTRL_DT_INST_DEFINE(index); \
-	IF_ENABLED(CONFIG_UART_INTERRUPT_DRIVEN, ( \
+	IF_ENABLED(UART_CC35XX_IRQ_ENABLED, ( \
 	static void uart_cc35xx_cfg_func_##index(const struct device *dev) \
 	{ \
-		IF_ENABLED(CONFIG_UART_INTERRUPT_DRIVEN, ( \
-			IRQ_CONNECT(DT_INST_IRQN(index), \
-			    DT_INST_IRQ(index, priority), \
-			    uart_cc35xx_isr, DEVICE_DT_INST_GET(index), \
-			    0); \
-			irq_enable(DT_INST_IRQN(index))) \
-		); \
+		ARG_UNUSED(dev); \
+		IRQ_CONNECT(DT_INST_IRQN(index), DT_INST_IRQ(index, priority), \
+			uart_cc35xx_isr, DEVICE_DT_INST_GET(index), 0); \
+		irq_enable(DT_INST_IRQN(index)); \
 	})); \
 	static const struct uart_cc35xx_dev_config uart_cc35xx_dev_cfg_##index = { \
 		.base = DT_INST_REG_ADDR(index), \
 		.sys_clk_freq = DT_INST_PROP_BY_PHANDLE(index, clocks, clock_frequency), \
 		.pcfg = PINCTRL_DT_INST_DEV_CONFIG_GET(index), \
-		IF_ENABLED(CONFIG_UART_INTERRUPT_DRIVEN, \
+		IF_ENABLED(UART_CC35XX_IRQ_ENABLED, \
 		    (.irq_config_func = uart_cc35xx_cfg_func_##index,)) }; \
 	static struct uart_cc35xx_dev_data uart_cc35xx_dev_data_##index = { \
 		.baud_rate = DT_INST_PROP(index, current_speed), \
