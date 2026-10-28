@@ -166,12 +166,8 @@ static int spi_cc35xx_configure(const struct device *dev, const struct spi_confi
 	struct spi_cc35xx_data *data = dev->data;
 	struct spi_context *ctx = &data->ctx;
 	int is_master = SPI_OP_MODE_GET(config->operation) == SPI_OP_MODE_MASTER;
-	uint32_t prot, freq;
+	uint32_t prot, freq, divider = 1;
 	int ret, mode;
-
-	if (spi_context_configured(ctx, config)) {
-		return 0;
-	}
 
 	if (config->operation & SPI_HALF_DUPLEX) {
 		LOG_ERR("Half-duplex not supported");
@@ -182,6 +178,26 @@ static int spi_cc35xx_configure(const struct device *dev, const struct spi_confi
 		LOG_ERR("Word sizes other than 8 bits are not supported");
 		return -ENOTSUP;
 	}
+
+	if (IS_ENABLED(CONFIG_SPI_EXTENDED_MODES) &&
+	    (config->operation & SPI_LINES_MASK) != SPI_LINES_SINGLE) {
+		return -ENOTSUP;
+	}
+
+	if (is_master) {
+		if (config->frequency == 0) {
+			return -EINVAL;
+		}
+		divider = DIV_ROUND_UP((uint64_t)cfg->sys_clk_freq, 2ULL * config->frequency);
+		if (divider > FIELD_GET(SPI_CLKCFG1_SCR_M, SPI_CLKCFG1_SCR_M) + 1U) {
+			return -EINVAL;
+		}
+	}
+
+	if (spi_context_configured(ctx, config)) {
+		return 0;
+	}
+	ctx->config = NULL;
 
 	SPIDisable(cfg->base);
 	SPIDisableInt(cfg->base, SPI_INT_ALL);
@@ -199,13 +215,18 @@ static int spi_cc35xx_configure(const struct device *dev, const struct spi_confi
 	}
 
 	prot = is_master ? SPI_CTL0_FRF_MOTOROLA_3WIRE : SPI_CTL0_FRF_MOTOROLA_4WIRE;
-	freq = is_master ? config->frequency : SPI_SLAVE_BUS_MAX_FREQ;
+	freq = is_master ? MIN(config->frequency, cfg->sys_clk_freq / 2U) : SPI_SLAVE_BUS_MAX_FREQ;
 	prot |= SPI_MODE_GET(config->operation) & SPI_MODE_CPOL ? SPI_CTL0_SPO_HIGH
 								: SPI_CTL0_SPO_LOW;
 	prot |= SPI_MODE_GET(config->operation) & SPI_MODE_CPHA ? SPI_CTL0_SPH_SECOND
 								: SPI_CTL0_SPH_FIRST;
 
 	SPIConfigSetExpClk(cfg->base, cfg->sys_clk_freq, prot, mode, freq, 8);
+	if (is_master) {
+		sys_write32((sys_read32(cfg->base + SPI_O_CLKCFG1) & ~SPI_CLKCFG1_SCR_M) |
+				    FIELD_PREP(SPI_CLKCFG1_SCR_M, divider - 1U),
+			    cfg->base + SPI_O_CLKCFG1);
+	}
 	sys_write32(SPI_IFLS_RXSEL_LEVEL_1 | SPI_IFLS_TXSEL_LVL_1_2, cfg->base + SPI_O_IFLS);
 
 	if (config->operation & SPI_TRANSFER_LSB) {
@@ -293,9 +314,7 @@ static int spi_cc35xx_dma_transmit_next_packet(const struct device *dev,
 		data->dma_status_flags &= ~SPI_CC35XX_DMA_TX_TRANSFER_DONE;
 	}
 
-	spi_cc35xx_dma_start(dev, dir);
-
-	return 0;
+	return spi_cc35xx_dma_start(dev, dir);
 }
 #else
 static void spi_cc35xx_master_transceive(const struct device *dev)
@@ -337,7 +356,8 @@ static int spi_cc35xx_transceive(const struct device *dev, const struct spi_conf
 
 	ret = spi_cc35xx_configure(dev, config);
 	if (ret) {
-		goto ctx_release;
+		spi_context_release(ctx, ret);
+		return ret;
 	}
 
 	spi_cc35xx_flush_fifo(dev);
@@ -363,7 +383,10 @@ static int spi_cc35xx_transceive(const struct device *dev, const struct spi_conf
 	spi_context_cs_control(ctx, true);
 #endif /* CONFIG_SPI_SLAVE */
 
-	spi_cc35xx_dma_transmit_next_packet(dev, SPI_CC35XX_TRANSFER_DIR_BOTH);
+	ret = spi_cc35xx_dma_transmit_next_packet(dev, SPI_CC35XX_TRANSFER_DIR_BOTH);
+	if (ret) {
+		goto ctx_release;
+	}
 #else
 	data->rxleft = spi_context_total_rx_len(ctx);
 
@@ -426,6 +449,17 @@ static int spi_cc35xx_release(const struct device *dev, const struct spi_config 
 	return 0;
 }
 
+#ifdef CONFIG_SPI_CC35XX_DMA_DRIVEN
+static void spi_cc35xx_dma_fail(const struct device *dev, int status)
+{
+	struct spi_cc35xx_data *data = dev->data;
+
+	spi_cc35xx_dma_stop(dev);
+	spi_context_cs_control(&data->ctx, false);
+	spi_context_complete(&data->ctx, dev, status);
+}
+#endif
+
 static void spi_cc35xx_isr(const struct device *dev)
 {
 	const struct spi_cc35xx_config *cfg = dev->config;
@@ -461,6 +495,9 @@ static void spi_cc35xx_isr(const struct device *dev)
 	}
 
 	if (irq_status & SPI_MIS_RXOVF) {
+#ifdef CONFIG_SPI_CC35XX_DMA_DRIVEN
+		spi_cc35xx_dma_stop(dev);
+#endif
 		SPIClearInt(cfg->base, SPI_MIS_RXOVF);
 		LOG_ERR("%s: RX overflow occurred", dev->name);
 		spi_cc35xx_read_rx_fifo(dev);
@@ -468,10 +505,12 @@ static void spi_cc35xx_isr(const struct device *dev)
 		spi_cc35xx_flush_fifo(dev);
 		spi_context_cs_control(ctx, false);
 		spi_context_complete(ctx, dev, -EIO);
+		return;
 	}
 
 #ifdef CONFIG_SPI_CC35XX_DMA_DRIVEN
 	uint32_t dma_done = irq_status & data->dma_pending;
+	int ret;
 
 	if (dma_done == 0) {
 		return;
@@ -517,11 +556,19 @@ static void spi_cc35xx_isr(const struct device *dev)
 		}
 
 		if (rx_done) {
-			spi_cc35xx_dma_transmit_next_packet(dev, SPI_CC35XX_TRANSFER_DIR_RX);
+			ret = spi_cc35xx_dma_transmit_next_packet(dev, SPI_CC35XX_TRANSFER_DIR_RX);
+			if (ret) {
+				spi_cc35xx_dma_fail(dev, ret);
+				return;
+			}
 		}
 
 		if (tx_done) {
-			spi_cc35xx_dma_transmit_next_packet(dev, SPI_CC35XX_TRANSFER_DIR_TX);
+			ret = spi_cc35xx_dma_transmit_next_packet(dev, SPI_CC35XX_TRANSFER_DIR_TX);
+			if (ret) {
+				spi_cc35xx_dma_fail(dev, ret);
+				return;
+			}
 		}
 		return;
 	}
@@ -546,7 +593,10 @@ static void spi_cc35xx_isr(const struct device *dev)
 			return;
 		}
 
-		spi_cc35xx_dma_transmit_next_packet(dev, SPI_CC35XX_TRANSFER_DIR_BOTH);
+		ret = spi_cc35xx_dma_transmit_next_packet(dev, SPI_CC35XX_TRANSFER_DIR_BOTH);
+		if (ret) {
+			spi_cc35xx_dma_fail(dev, ret);
+		}
 	}
 #endif /* CONFIG_SPI_CC35XX_DMA_DRIVEN */
 }
@@ -663,7 +713,7 @@ static int spi_cc35xx_dma_start(const struct device *dev, enum transfer_directio
 		data->dma_pending |= SPI_MIS_DMATX;
 		ret = dma_start(data->dma_tx.dev_dma, data->dma_tx.dma_channel);
 		if (ret) {
-			data->dma_pending &= ~SPI_MIS_DMATX;
+			spi_cc35xx_dma_stop(dev);
 			irq_unlock(key);
 			return ret;
 		}
@@ -679,7 +729,7 @@ static int spi_cc35xx_dma_start(const struct device *dev, enum transfer_directio
 		data->dma_pending |= SPI_MIS_DMARX;
 		ret = dma_start(data->dma_rx.dev_dma, data->dma_rx.dma_channel);
 		if (ret) {
-			data->dma_pending &= ~SPI_MIS_DMARX;
+			spi_cc35xx_dma_stop(dev);
 			irq_unlock(key);
 			return ret;
 		}
