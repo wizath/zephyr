@@ -31,6 +31,7 @@
 #define RTC_TI_CC35XX_EPOCH_YEAR (CONFIG_RTC_TI_CC35XX_EPOCH_YEAR - 1900)
 
 #define RTC_TI_CC35XX_TOP_19_BITS_MASK 0xFFFFE000
+#define RTC_TI_CC35XX_TIME_MAX_US      (BIT64(51) - 1)
 
 struct rtc_ti_cc35xx_data {
 	struct k_spinlock lock;
@@ -94,10 +95,9 @@ static void rtc_ti_cc35xx_set_dtime(struct rtc_ti_cc35xx_data *data, int64_t del
 	k_spinlock_key_t key;
 	uint32_t raw_data;
 
-	if (IN_RANGE(delta_us, -RTC_TI_CC35XX_HIGH_RES_RANGE_US,
-		     RTC_TI_CC35XX_HIGH_RES_RANGE_US - 1)) {
-		raw_data = (uint32_t)((delta_us << RTC_TI_CC35XX_HIGH_RES_STEP_SHIFT) &
-				      RTC_TI_CC35XX_STEP_MASK);
+	if (IN_RANGE(delta_us, 0, RTC_TI_CC35XX_HIGH_RES_RANGE_US - 1)) {
+		raw_data = ((uint32_t)delta_us << RTC_TI_CC35XX_HIGH_RES_STEP_SHIFT) &
+			   RTC_TI_CC35XX_STEP_MASK;
 	} else {
 		raw_data = RTC_TI_CC35XX_DTIME_EXP;
 		raw_data |= (uint32_t)((delta_us >> RTC_TI_CC35XX_LOW_RES_STEP_SHIFT) &
@@ -140,16 +140,24 @@ static int rtc_ti_cc35xx_set_time(const struct device *dev, const struct rtc_tim
 
 	sec_bias = (uint64_t)rtc_bias_1970_to_xxxx(RTC_TI_CC35XX_EPOCH_YEAR);
 	sec_hw_target = sec_unix_target - sec_bias;
+	if (sec_hw_target < 0 ||
+	    sec_hw_target > (int64_t)(RTC_TI_CC35XX_TIME_MAX_US / USEC_PER_SEC)) {
+		return -ERANGE;
+	}
 	usec_hw_target = sec_hw_target * USEC_PER_SEC;
-	/*
-	 * This function is for setting time using low resolution (1.049s)
-	 * so truncate anything smaller to avoid rounding issues.
-	 */
-	usec_hw_time = (rtc_ti_cc35xx_get_raw_time(data) / USEC_PER_SEC) * USEC_PER_SEC;
-
-	delta_us = usec_hw_target - usec_hw_time;
-
-	rtc_ti_cc35xx_set_dtime(data, delta_us);
+	while (true) {
+		usec_hw_time = rtc_ti_cc35xx_get_raw_time(data);
+		/* DTIME and the RTC counter wrap at 51 integer time bits. */
+		delta_us = ((uint64_t)usec_hw_target - usec_hw_time) & RTC_TI_CC35XX_TIME_MAX_US;
+		if (delta_us > (int64_t)(RTC_TI_CC35XX_TIME_MAX_US >> 1)) {
+			delta_us -= RTC_TI_CC35XX_TIME_MAX_US + 1;
+		}
+		rtc_ti_cc35xx_set_dtime(data, delta_us);
+		if (IN_RANGE(delta_us, 0, RTC_TI_CC35XX_HIGH_RES_RANGE_US - 1)) {
+			break;
+		}
+		/* Finish coarse and backward adjustments with a positive fine step. */
+	}
 
 	return 0;
 }
