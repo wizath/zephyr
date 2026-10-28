@@ -86,6 +86,7 @@ struct spi_cc35xx_data {
 	struct spi_cc35xx_dma_stream dma_rx;
 	struct spi_cc35xx_dma_stream dma_tx;
 	uint8_t dma_status_flags;
+	uint32_t dma_pending;
 	uint8_t tx_scratch_buf[CONFIG_SPI_CC35XX_DMA_SCRATCH_BUFFER_SIZE];
 #endif /* CONFIG_SPI_CC35XX_DMA_DRIVEN */
 	size_t rxleft;
@@ -470,13 +471,20 @@ static void spi_cc35xx_isr(const struct device *dev)
 	}
 
 #ifdef CONFIG_SPI_CC35XX_DMA_DRIVEN
-	if (irq_status & SPI_MIS_DMARX) {
+	uint32_t dma_done = irq_status & data->dma_pending;
+
+	if (dma_done == 0) {
+		return;
+	}
+	data->dma_pending &= ~dma_done;
+
+	if (dma_done & SPI_MIS_DMARX) {
 		SPIDisableInt(cfg->base, SPI_MIS_DMARX);
 		SPIClearInt(cfg->base, SPI_MIS_DMARX);
 		data->dma_status_flags |= SPI_CC35XX_DMA_RX_TRANSFER_DONE;
 	}
 
-	if (irq_status & SPI_MIS_DMATX) {
+	if (dma_done & SPI_MIS_DMATX) {
 		SPIDisableInt(cfg->base, SPI_MIS_DMATX);
 		SPIClearInt(cfg->base, SPI_MIS_DMATX);
 		data->dma_status_flags |= SPI_CC35XX_DMA_TX_TRANSFER_DONE;
@@ -498,6 +506,9 @@ static void spi_cc35xx_isr(const struct device *dev)
 		}
 
 		if (!spi_context_rx_buf_on(ctx) && !spi_context_tx_buf_on(ctx)) {
+			if (data->dma_pending != 0) {
+				return;
+			}
 			/* nothing left to rx or tx, we're done! */
 			spi_cc35xx_dma_stop(dev);
 			spi_context_complete(&data->ctx, dev, 0);
@@ -523,7 +534,8 @@ static void spi_cc35xx_isr(const struct device *dev)
 		spi_context_update_tx(&data->ctx, SPI_CC35XX_DFS,
 				      data->ctx.tx_len ? data->dma_tx.transfer_length : 0);
 
-		if (!spi_context_rx_buf_on(ctx) && !spi_context_tx_buf_on(ctx)) {
+		if (!spi_context_rx_buf_on(ctx) && !spi_context_tx_buf_on(ctx) &&
+		    data->dma_pending == 0) {
 			/* nothing left to rx or tx, we're done! */
 			if (!(ctx->config->operation & SPI_HOLD_ON_CS)) {
 				spi_context_cs_control(&data->ctx, false);
@@ -574,6 +586,8 @@ static void spi_cc35xx_dma_stop(const struct device *dev)
 	SPIDisableInt(cfg->base, SPI_MIS_DMATX_SET | SPI_MIS_DMARX_SET | SPI_MIS_RXOVF);
 	dma_stop(data->dma_rx.dev_dma, data->dma_rx.dma_channel);
 	dma_stop(data->dma_tx.dev_dma, data->dma_tx.dma_channel);
+	data->dma_pending = 0;
+	data->dma_status_flags = 0;
 }
 
 static int spi_cc35xx_dma_load_tx(const struct device *dev, const uint8_t *tx_data, size_t buf_size)
@@ -637,6 +651,7 @@ static int spi_cc35xx_dma_start(const struct device *dev, enum transfer_directio
 {
 	const struct spi_cc35xx_config *cfg = dev->config;
 	struct spi_cc35xx_data *data = dev->data;
+	unsigned int key = irq_lock();
 	int ret;
 
 	if ((dir == SPI_CC35XX_TRANSFER_DIR_TX) || (dir == SPI_CC35XX_TRANSFER_DIR_BOTH)) {
@@ -645,8 +660,11 @@ static int spi_cc35xx_dma_start(const struct device *dev, enum transfer_directio
 		SPIClearInt(cfg->base, SPI_MIS_DMATX_SET);
 		SPIEnableInt(cfg->base, SPI_MIS_DMATX_SET);
 
+		data->dma_pending |= SPI_MIS_DMATX;
 		ret = dma_start(data->dma_tx.dev_dma, data->dma_tx.dma_channel);
 		if (ret) {
+			data->dma_pending &= ~SPI_MIS_DMATX;
+			irq_unlock(key);
 			return ret;
 		}
 		SPIEnableDMA(cfg->base, SPI_DMACR_TXEN);
@@ -658,14 +676,18 @@ static int spi_cc35xx_dma_start(const struct device *dev, enum transfer_directio
 		SPIClearInt(cfg->base, SPI_MIS_DMARX_SET | SPI_MIS_RXOVF);
 		SPIEnableInt(cfg->base, SPI_MIS_DMARX_SET | SPI_MIS_RXOVF);
 
+		data->dma_pending |= SPI_MIS_DMARX;
 		ret = dma_start(data->dma_rx.dev_dma, data->dma_rx.dma_channel);
 		if (ret) {
+			data->dma_pending &= ~SPI_MIS_DMARX;
+			irq_unlock(key);
 			return ret;
 		}
 
 		SPIEnableDMA(cfg->base, SPI_DMACR_RXEN);
 	}
 
+	irq_unlock(key);
 	return 0;
 }
 static int spi_cc35xx_dma_init(const struct device *dev)
