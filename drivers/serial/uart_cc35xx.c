@@ -103,6 +103,7 @@ struct uart_cc35xx_dev_data {
 	size_t rx_dma_block_size; /* Number of bytes of the current DMA block */
 	size_t rx_buf_filled;     /* Bytes already written into rx_buf*/
 	size_t rx_processed;      /* Bytes already reported to the user via UART_RX_RDY */
+	size_t rx_timeout_pos;    /* DMA progress observed by the inactivity timer */
 	uint8_t *rx_next_buf;     /* Next RX buffer queued by the user (via rx_buf_rsp) */
 	size_t rx_next_buflen;    /* Length of rx_next_buf in bytes */
 
@@ -311,7 +312,7 @@ static bool uart_cc35xx_notify_rx_processed(struct uart_cc35xx_dev_data *data, s
 
 	/* Nothing to report if there is no callback or no new data */
 	if (!data->async_callback || data->rx_processed == processed) {
-		return true;
+		return last || data->rx_buflen == processed;
 	}
 
 	if (last || (data->rx_buflen == processed) || (data->dma_rx.timeout > 0)) {
@@ -779,6 +780,7 @@ static int uart_cc35xx_async_rx_enable_dma(struct uart_cc35xx_dev_data *data)
 	/* Only request the remaining space in the buffer */
 	data->dma_rx.blk_cfg.block_size = data->rx_buflen - data->rx_buf_filled;
 	data->rx_dma_block_size = data->rx_buflen - data->rx_buf_filled;
+	data->rx_timeout_pos = data->rx_buf_filled;
 
 	ret = dma_config(data->dma_rx.dev_dma, data->dma_rx.dma_channel, &data->dma_rx.dma_cfg);
 	if (ret) {
@@ -788,6 +790,9 @@ static int uart_cc35xx_async_rx_enable_dma(struct uart_cc35xx_dev_data *data)
 	/* Disable DMA trigger before starting the channel to avoid a race */
 	UARTDisableDma(config->base, UART_DMA_RX);
 
+	UARTClearInt(config->base, UART_INT_RXDMADONE | UART_INT_OE | UART_INT_RT);
+	UARTEnableInt(config->base, UART_INT_RXDMADONE | UART_INT_OE | UART_INT_RT);
+
 	/* Start DMA channel */
 	ret = dma_start(data->dma_rx.dev_dma, data->dma_rx.dma_channel);
 	if (ret) {
@@ -796,8 +801,6 @@ static int uart_cc35xx_async_rx_enable_dma(struct uart_cc35xx_dev_data *data)
 
 	/* Arm UART DMA RX trigger and clear / enable relevant interrupts */
 	UARTEnableDma(config->base, UART_DMA_RX);
-	UARTClearInt(config->base, UART_INT_RXDMADONE | UART_INT_OE | UART_INT_RT);
-	UARTEnableInt(config->base, UART_INT_RXDMADONE | UART_INT_OE | UART_INT_RT);
 
 	/* Restart the software inactivity timeout, if configured */
 	if (data->dma_rx.timeout > 0) {
@@ -891,6 +894,7 @@ static int uart_cc35xx_async_rx_disable_dma(struct uart_cc35xx_dev_data *data)
  */
 static int uart_cc35xx_async_rx_disable(const struct device *dev)
 {
+	const struct uart_cc35xx_dev_config *config = dev->config;
 	struct uart_cc35xx_dev_data *data = dev->data;
 	struct uart_event evt;
 	unsigned int key;
@@ -907,21 +911,40 @@ static int uart_cc35xx_async_rx_disable(const struct device *dev)
 
 	uart_cc35xx_async_rx_disable_dma(data);
 
-	/* Report any data that was received but not yet notified */
+	/* Flush DMA progress and FIFO data through the supplied buffers. */
 	ret = dma_get_status(data->dma_rx.dev_dma, data->dma_rx.dma_channel, &dma_stat);
+	rx_processed = data->rx_buf_filled;
 	if (ret == 0) {
-		rx_processed =
-			data->rx_buf_filled + (data->rx_dma_block_size - dma_stat.pending_length);
-
-		uart_cc35xx_notify_rx_processed(data, rx_processed, true);
+		rx_processed += data->rx_dma_block_size - dma_stat.pending_length;
 	}
 
-	/* Release the current RX buffer */
-	if (data->async_callback) {
-		evt.type = UART_RX_BUF_RELEASED;
-		evt.data.rx_buf.buf = data->rx_buf;
+	while (true) {
+		rx_processed += uart_cc35xx_fifo_read(dev, data->rx_buf + rx_processed,
+						      data->rx_buflen - rx_processed);
+		uart_cc35xx_notify_rx_processed(data, rx_processed, true);
 
-		data->async_callback(dev, &evt, data->async_user_data);
+		if (data->async_callback) {
+			evt.type = UART_RX_BUF_RELEASED;
+			evt.data.rx_buf.buf = data->rx_buf;
+			data->async_callback(dev, &evt, data->async_user_data);
+		}
+
+		if (data->rx_next_buflen == 0 || !UARTCharAvailable(config->base)) {
+			break;
+		}
+
+		data->rx_buf = data->rx_next_buf;
+		data->rx_buflen = data->rx_next_buflen;
+		data->rx_next_buf = NULL;
+		data->rx_next_buflen = 0;
+		data->rx_buf_filled = 0;
+		data->rx_processed = 0;
+		rx_processed = 0;
+
+		if (data->async_callback) {
+			evt.type = UART_RX_BUF_REQUEST;
+			data->async_callback(dev, &evt, data->async_user_data);
+		}
 	}
 
 	data->rx_buf = NULL;
@@ -993,6 +1016,26 @@ static void uart_cc35xx_async_rx_timeout(struct k_work *work)
 	struct uart_event evt;
 
 	key = irq_lock();
+	if (data->rx_buflen == 0) {
+		irq_unlock(key);
+		return;
+	}
+
+	ret = dma_get_status(data->dma_rx.dev_dma, data->dma_rx.dma_channel, &dma_stat);
+	if (ret != 0) {
+		k_work_reschedule(&data->dma_rx.timeout_work, K_USEC(data->dma_rx.timeout));
+		irq_unlock(key);
+		return;
+	}
+
+	rx_processed = data->rx_buf_filled + data->rx_dma_block_size - dma_stat.pending_length;
+	if (rx_processed == 0 || rx_processed != data->rx_timeout_pos) {
+		data->rx_timeout_pos = rx_processed;
+		k_work_reschedule(&data->dma_rx.timeout_work, K_USEC(data->dma_rx.timeout));
+		irq_unlock(key);
+		return;
+	}
+
 	uart_cc35xx_async_rx_disable_dma(data);
 
 	/* Compute total bytes received: previously filled + current DMA progress */
